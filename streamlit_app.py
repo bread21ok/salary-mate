@@ -2,7 +2,7 @@
 streamlit_app.py
 =================
 급여메이트 웹앱
-왼쪽 사이드바 메뉴: 급여계산 / 챗봇 / 참고자료집
+왼쪽 사이드바 메뉴: 급여계산 / 자료 검색 / 참고자료집
 
 실행 방법: streamlit run streamlit_app.py
 """
@@ -77,13 +77,13 @@ with st.sidebar:
     st.markdown("---")
     page = st.radio(
         "메뉴",
-        options=["급여계산", "챗봇", "참고자료집"],
+        options=["급여계산", "자료 검색", "참고자료집"],
         label_visibility="collapsed",
     )
 
 st.markdown(
     '<div class="app-header"><h1>💰 급여메이트</h1>'
-    '<p>기간제근로자 급여 자동 계산 · 상담 챗봇 · 참고자료 모음</p></div>',
+    '<p>기간제근로자 급여 자동 계산 · 자료 검색 · 참고자료 모음</p></div>',
     unsafe_allow_html=True,
 )
 
@@ -163,78 +163,167 @@ def render_salary_page():
 
 
 # =======================================================================
-# 페이지 2: 챗봇 (Claude API 연동)
+# 페이지 2: 자료 검색 (AI 없이, 참고자료집 안에서 키워드로 관련 내용을 찾아 보여줌)
 # =======================================================================
-SYSTEM_PROMPT = (
-    "당신은 '급여메이트' 웹앱의 상담 챗봇입니다. "
-    "기간제근로자 급여, 4대보험, 소득세, 이 앱의 사용법에 대한 질문에 "
-    "친절하고 쉽게 한국어로 답변하세요. 확실하지 않은 법령/세율 정보는 "
-    "반드시 관할 기관(국세청, 4대보험 공단 등)에 확인하라고 안내하세요."
-)
+SUPPORTED_EXTENSIONS = {"txt", "pdf", "docx"}
 
 
-def render_chatbot_page():
+def _get_reference_version_key():
+    """reference_docs 폴더 안 파일 목록/수정시각을 캐시 판단용 키로 만든다."""
+    if not os.path.isdir(REFERENCE_DIR):
+        return ()
+    items = []
+    for fname in sorted(os.listdir(REFERENCE_DIR)):
+        path = os.path.join(REFERENCE_DIR, fname)
+        if os.path.isfile(path) and fname != "README.txt":
+            items.append((fname, os.path.getmtime(path), os.path.getsize(path)))
+    return tuple(items)
+
+
+@st.cache_data(show_spinner="참고자료집을 읽는 중입니다...")
+def _load_reference_texts(_version_key):
+    """reference_docs 폴더의 파일들을 읽어 {파일명: 텍스트} 형태로 반환한다."""
+    texts = {}
+    unsupported = []
+
+    if not os.path.isdir(REFERENCE_DIR):
+        return texts, unsupported
+
+    for fname in sorted(os.listdir(REFERENCE_DIR)):
+        path = os.path.join(REFERENCE_DIR, fname)
+        if not os.path.isfile(path) or fname == "README.txt":
+            continue
+
+        ext = fname.lower().rsplit(".", 1)[-1] if "." in fname else ""
+
+        if ext not in SUPPORTED_EXTENSIONS:
+            unsupported.append(fname)
+            continue
+
+        try:
+            if ext == "txt":
+                with open(path, encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+            elif ext == "pdf":
+                from pypdf import PdfReader
+                reader = PdfReader(path)
+                content = "\n".join((page.extract_text() or "") for page in reader.pages)
+            elif ext == "docx":
+                import docx
+                doc = docx.Document(path)
+                content = "\n".join(p.text for p in doc.paragraphs)
+            else:
+                content = ""
+            texts[fname] = content.strip()
+        except Exception as e:
+            texts[fname] = f"[읽기 오류: {e}]"
+
+    return texts, unsupported
+
+
+def _split_into_chunks(text: str, max_chunk_chars: int = 350) -> list:
+    """문서 텍스트를 검색하기 좋은 크기(약 350자)의 덩어리(청크)로 나눈다."""
+    lines = [line.strip() for line in text.split("\n") if line.strip()]
+    chunks = []
+    buffer = ""
+    for line in lines:
+        if buffer and len(buffer) + len(line) + 1 > max_chunk_chars:
+            chunks.append(buffer)
+            buffer = line
+        else:
+            buffer = (buffer + " " + line).strip()
+    if buffer:
+        chunks.append(buffer)
+    return chunks
+
+
+def _search_reference(query: str, texts: dict, top_k: int = 5) -> list:
+    """
+    query에 포함된 단어들이 얼마나 등장하는지로 각 문서 청크에 점수를 매겨
+    가장 관련성 높은 상위 top_k개를 반환한다.
+    반환 항목: {"file": 파일명, "text": 청크내용, "score": 점수}
+    """
+    keywords = [w for w in query.strip().split() if len(w) >= 1]
+    if not keywords:
+        return []
+
+    results = []
+    for fname, content in texts.items():
+        if not content:
+            continue
+        for chunk in _split_into_chunks(content):
+            score = 0
+            for kw in keywords:
+                score += chunk.count(kw)
+            if query.strip() in chunk:
+                score += 5  # 질문 문장 전체가 그대로 들어있으면 가산점
+            if score > 0:
+                results.append({"file": fname, "text": chunk, "score": score})
+
+    results.sort(key=lambda r: r["score"], reverse=True)
+    return results[:top_k]
+
+
+def _highlight(text: str, query: str) -> str:
+    """검색어에 포함된 단어들을 텍스트에서 굵게 강조 표시한다."""
+    import re
+    keywords = sorted({w for w in query.strip().split() if len(w) >= 1}, key=len, reverse=True)
+    highlighted = text
+    for kw in keywords:
+        pattern = re.escape(kw)
+        highlighted = re.sub(f"({pattern})", r"**\1**", highlighted)
+    return highlighted
+
+
+def render_search_page():
     with st.container(border=True):
-        st.subheader("💬 급여메이트 챗봇")
-        st.caption("급여·4대보험·세금이나 이 앱 사용법에 대해 자유롭게 물어보세요.")
+        st.subheader("🔎 자료 검색")
+        st.caption("참고자료집 문서 안에서 입력한 단어가 포함된 내용을 찾아 보여드립니다. (AI를 사용하지 않는 순수 검색 기능입니다)")
 
-    api_key = st.secrets.get("ANTHROPIC_API_KEY", None)
-    if not api_key:
-        st.error(
-            "⚠️ Claude API 키가 설정되어 있지 않습니다.\n\n"
-            "Streamlit Cloud 앱 관리 화면 → Settings → Secrets 에서\n"
-            'ANTHROPIC_API_KEY = "여기에_API_키_입력"\n'
-            "형식으로 추가해주세요."
-        )
-        return
+    version_key = _get_reference_version_key()
+    reference_texts, unsupported_files = _load_reference_texts(version_key)
 
-    try:
-        import anthropic
-    except ImportError:
-        st.error("anthropic 패키지가 설치되어 있지 않습니다. requirements.txt에 'anthropic'을 추가해주세요.")
-        return
+    with st.expander(f"📎 현재 인식된 참고자료 ({len([t for t in reference_texts.values() if t])}건)", expanded=False):
+        if reference_texts:
+            for fname, content in reference_texts.items():
+                ok = "✅" if content else "⚠️ 읽기 실패"
+                st.markdown(f"- {ok} {fname}")
+        else:
+            st.markdown("등록된 참고자료가 없습니다. '참고자료집' 메뉴 안내를 참고해 파일을 추가해주세요.")
 
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = []
+        if unsupported_files:
+            st.warning(
+                "다음 파일은 형식이 지원되지 않아 검색되지 않습니다 (PDF/DOCX/TXT로 변환 후 다시 올려주세요): "
+                + ", ".join(unsupported_files)
+            )
 
-    for msg in st.session_state.chat_history:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
+    query = st.text_input(
+        "검색어를 입력하세요",
+        placeholder="예: 장애인 자녀 고용보험 / 65세 이상 취득 / 계약만료 정산",
+    )
+    search_clicked = st.button("🔍 검색", type="primary")
 
-    user_input = st.chat_input("궁금한 점을 입력하세요...")
+    if search_clicked or query:
+        if not query.strip():
+            st.warning("검색어를 입력해주세요.")
+        else:
+            results = _search_reference(query, reference_texts, top_k=5)
 
-    if user_input:
-        st.session_state.chat_history.append({"role": "user", "content": user_input})
-        with st.chat_message("user"):
-            st.markdown(user_input)
-
-        with st.chat_message("assistant"):
-            placeholder = st.empty()
-            try:
-                client = anthropic.Anthropic(api_key=api_key)
-                response = client.messages.create(
-                    model="claude-sonnet-5",
-                    max_tokens=1024,
-                    system=SYSTEM_PROMPT,
-                    messages=[
-                        {"role": m["role"], "content": m["content"]}
-                        for m in st.session_state.chat_history
-                    ],
+            if results:
+                st.success(f"관련 내용 {len(results)}건을 찾았습니다.")
+                for i, r in enumerate(results, start=1):
+                    with st.container(border=True):
+                        st.markdown(f"**{i}. 출처: 📄 {r['file']}**")
+                        st.markdown(_highlight(r["text"], query))
+            else:
+                st.warning("등록된 참고자료에서 관련 내용을 찾지 못했습니다.")
+                import urllib.parse
+                search_url = "https://www.google.com/search?q=" + urllib.parse.quote(query)
+                st.markdown(
+                    f"자료에 없는 내용이라면, 아래 링크로 직접 웹에서 유사 사례를 찾아보실 수 있어요.\n\n"
+                    f"🔗 [Google에서 \"{query}\" 검색해보기]({search_url})\n\n"
+                    f"※ 이 링크는 자동 검색이 아니라, 클릭하면 새 탭에서 직접 검색 결과를 확인하는 참고용 링크입니다."
                 )
-                answer = "".join(
-                    block.text for block in response.content if block.type == "text"
-                )
-            except Exception as e:
-                answer = f"오류가 발생했습니다: {e}"
-
-            placeholder.markdown(answer)
-
-        st.session_state.chat_history.append({"role": "assistant", "content": answer})
-
-    if st.session_state.chat_history:
-        if st.button("🗑️ 대화 초기화"):
-            st.session_state.chat_history = []
-            st.rerun()
 
 
 # =======================================================================
@@ -282,7 +371,7 @@ def render_reference_page():
 # =======================================================================
 if page == "급여계산":
     render_salary_page()
-elif page == "챗봇":
-    render_chatbot_page()
+elif page == "자료 검색":
+    render_search_page()
 elif page == "참고자료집":
     render_reference_page()
